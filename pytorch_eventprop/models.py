@@ -90,6 +90,11 @@ class SpikingLinear_ev(MetaModule):
         self.alpha = np.exp(-self.dt / self.tau_s)
         self.beta = np.exp(-self.dt / self.tau_m)
 
+        self.max_delay = int(kwargs.get("max_delay") // 1) #think should be dt, bit confused about the timestep in the code
+
+        if self.max_delay > 0:
+            self.P = nn.Parameter(torch.Tensor(d2, d1),requires_grad=False)
+            self.IDX = torch.nn.Parameter(torch.arange(0, self.max_delay),requires_grad=False).expand(d2, d1, -1).permute(2, 0, 1)
         self.weight = nn.Parameter(torch.Tensor(d2, d1))
 
         self.init_mode = kwargs.get("init_mode", "kaiming")
@@ -116,6 +121,10 @@ class SpikingLinear_ev(MetaModule):
             nn.init.uniform_(self.weight, -self.mu, self.mu)
         else:
             raise ValueError(f"Invalid init_mode {self.init_mode}")
+        
+        if self.max_delay > 0:
+            nn.init.uniform_(self.P, 0, self.max_delay)
+            self.P.round_()
 
         if self.init_mode != "kaiming_both" and not isinstance(self.scale, list):
             self.weight.data *= self.scale
@@ -193,15 +202,26 @@ class SpikingLinear_ev(MetaModule):
 
         # input = torch.roll(input, 1, dims=0)
         # print("Spike is at time", input.argmax().data.item())
+        if self.max_delay > 0:
+            X = self.IDX - self.P
+            X = ((1 - X.abs()).relu())
+            K = (X * self.weight)
+            K = K.permute(1, 2, 0)
+            input_padded = F.pad(input.permute(1,2,0), (self.max_delay-1, 0), 'constant', 0)
 
         while True:
             for i in range(1, steps):
                 # spikes = (V[i - 1] > 1.0).float()
                 # V[i - 1] = (1 - spikes) * V[i - 1]
-
-                input_t = F.linear(
-                    input[i - 1].float(), self.weight if weights is None else weights
-                )
+                if self.max_delay > 0:
+                    input_t = F.conv1d(
+                        input_padded[:,:,i - 1:i - 1 + self.max_delay].float(),
+                        K,
+                    ).permute(2,0,1)
+                else:
+                    input_t = F.linear(
+                        input[i - 1].float(), self.weight if weights is None else weights
+                    )
                 if self.dropout_p:
                     input_t = F.dropout(input_t, p=self.dropout_p)
 
@@ -245,17 +265,29 @@ class SpikingLinear_ev(MetaModule):
         # input = torch.roll(input, 1, dims=0)
         # post_spikes = torch.roll(post_spikes, 1, dims=0)
         steps = input.shape[0]
-
-        lV = torch.zeros(steps, input.shape[1], self.output_dim).to(self.device)
-        lI = torch.zeros(steps, input.shape[1], self.output_dim).to(self.device)
-
+        if self.max_delay > 0:
+            lV = torch.zeros(steps+self.max_delay-1, input.shape[1], self.output_dim).to(self.device)
+            lI = torch.zeros(steps+self.max_delay-1, input.shape[1], self.output_dim).to(self.device)
+        else:
+            lV = torch.zeros(steps, input.shape[1], self.output_dim).to(self.device)
+            lI = torch.zeros(steps, input.shape[1], self.output_dim).to(self.device)
         grad_input = torch.zeros(steps, input.shape[1], input.shape[2]).to(self.device)
         grad_weight = torch.zeros(input.shape[1], *self.weight.shape).to(self.device)
         jumps, V_dots = [], []
 
+        if self.max_delay > 0:
+            X = self.IDX - self.P 
+            X = ((1 - X.abs()).relu()) #will use this for the actual gradient updates
+            K = (X * self.weight)
+            K = K.permute(2, 1, 0)
+            
+
         for i in range(steps - 2, -1, -1):
-            delta = lV[i + 1] - lI[i + 1]
-            grad_input[i] = F.linear(delta, self.weight.t() if weights is None else weights.t())
+            if self.max_delay > 0:
+                grad_input[i] = F.conv1d((lV[i + 1:i+self.max_delay+1] - lI[i + 1:i+self.max_delay+1]).permute(1,2,0), K).permute(2,0,1)
+            else:
+                delta = lV[i + 1] - lI[i + 1]
+                grad_input[i] = F.linear(delta, self.weight.t() if weights is None else weights.t())
 
             # Euler
             lI[i] = self.alpha * lI[i + 1] + (1 - self.alpha) * lV[i + 1]
@@ -300,7 +332,11 @@ class SpikingLinear_ev(MetaModule):
 
             # Accumulate grad
             spike_bool = input[i].float()
-            grad_weight -= self.tau_s * spike_bool.unsqueeze(1) * lI[i].unsqueeze(2)
+            if self.max_delay > 0:
+                lI_delayed = (X.unsqueeze(1) * lI[i:i+self.max_delay].unsqueeze(-1)).sum(0)
+                grad_weight -= self.tau_s * spike_bool.unsqueeze(1) * lI_delayed
+            else:
+                grad_weight -= self.tau_s * spike_bool.unsqueeze(1) * lI[i].unsqueeze(2) 
             # grad_weight -= spike_bool.unsqueeze(1)
 
         output_dict = {
