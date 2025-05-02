@@ -306,6 +306,7 @@ if __name__ == "__main__":
             "dropout": 0.0,
         },
         "device": torch.device("cpu"),
+        "max_delay": 7
     }
 
     model_config["weights"]["distribution"] = (
